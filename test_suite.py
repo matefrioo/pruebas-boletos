@@ -3,6 +3,7 @@ import re
 import secrets
 from datetime import date, timedelta
 
+import pytest
 from playwright.sync_api import Page, expect
 
 
@@ -202,6 +203,40 @@ def test_cp02_rechazo_por_edad(page: Page):
     expect(page.locator("form")).to_be_visible()
 
 
+# CP-02.1 / CP-02.2: edades bajo el requisito configurado deben rechazarse.
+# La app observada informa un mínimo de 50; con el requisito 60/65 estos casos
+# pueden revelar un incumplimiento. La expectativa se mantiene según el requisito.
+@pytest.mark.parametrize(
+    "edad",
+    [pytest.param(59, id="59-anios"), pytest.param(50, id="50-anios")],
+)
+def test_cp02_rechazo_de_edad_bajo_el_minimo(page: Page, edad: int):
+    assert EDAD_MINIMA_REQUERIDA in (60, 65), (
+        "Definí EDAD_MINIMA_REQUERIDA como 60 o 65 según el requisito."
+    )
+    iniciar_sesion(page)
+    abrir_beneficiarios(page)
+
+    completar_alta(
+        page,
+        nuevo_dni(),
+        nombre="Edad",
+        apellido="QA",
+        nacimiento=fecha_hace_anios(edad),
+    )
+    page.get_by_role(
+        "button", name="Registrar Beneficiario", exact=True
+    ).click()
+
+    expect(
+        page.get_by_text(
+            f"El beneficiario debe tener al menos {EDAD_MINIMA_REQUERIDA} años",
+            exact=True,
+        )
+    ).to_be_visible()
+    expect(page.locator("form")).to_be_visible()
+
+
 # CP-04: un DNI ya registrado no debe generar una segunda fila.
 def test_cp04_dni_duplicado(page: Page):
     iniciar_sesion(page)
@@ -217,25 +252,35 @@ def test_cp04_dni_duplicado(page: Page):
     expect(fila).to_have_count(1, timeout=15000)
 
 
-# CP-05: acreditar el máximo permitido de 15 boletos.
-def test_cp05_recarga_de_15(page: Page):
+# CP-05: acreditar cantidades válidas en el límite superior.
+@pytest.mark.parametrize(
+    "cantidad",
+    [pytest.param("14", id="14-boletos"), pytest.param("15", id="15-boletos")],
+)
+def test_cp05_recarga_en_limite_superior(page: Page, cantidad: str):
     iniciar_sesion(page)
     dni = crear_beneficiario_activo(page)
     saldo_inicial = saldo_listado(page, dni)
 
-    completar_recarga(page, dni, "15")
+    completar_recarga(page, dni, cantidad)
     page.get_by_role("button", name="Recargar", exact=True).click()
 
-    assert saldo_listado(page, dni) == saldo_inicial + 15
+    assert saldo_listado(page, dni) == saldo_inicial + int(cantidad)
 
 
-# CP-06: 16 boletos deben superar el límite HTML de 15.
-def test_cp06_rechazo_de_16_boletos(page: Page):
+# CP-06: cantidades superiores a 15 deben superar el límite HTML.
+@pytest.mark.parametrize(
+    "cantidad_invalida",
+    [pytest.param("16", id="16-boletos"), pytest.param("50", id="50-boletos")],
+)
+def test_cp06_rechazo_de_cantidad_superior_al_maximo(
+    page: Page, cantidad_invalida: str
+):
     iniciar_sesion(page)
     dni = crear_beneficiario_activo(page)
     saldo_inicial = saldo_listado(page, dni)
 
-    completar_recarga(page, dni, "16")
+    completar_recarga(page, dni, cantidad_invalida)
     cantidad = page.get_by_role("spinbutton")
 
     assert cantidad.evaluate("(el) => el.validity.rangeOverflow")
@@ -342,16 +387,16 @@ def test_cp11_dni_inexistente_en_recargas(page: Page):
 
 
 # CP-12: cero y valores negativos deben ser inválidos.
-def test_cp12_cero_y_negativo(page: Page):
+@pytest.mark.parametrize(
+    "cantidad_invalida",
+    [pytest.param("0", id="cero"), pytest.param("-1", id="negativo")],
+)
+def test_cp12_cantidad_cero_o_negativa(page: Page, cantidad_invalida: str):
     iniciar_sesion(page)
     dni = crear_beneficiario_activo(page)
 
-    completar_recarga(page, dni, "0")
+    completar_recarga(page, dni, cantidad_invalida)
     cantidad = page.get_by_role("spinbutton")
-    assert cantidad.evaluate("(el) => el.validity.rangeUnderflow")
-    assert not cantidad.evaluate("(el) => el.validity.valid")
-
-    cantidad.fill("-1")
     assert cantidad.evaluate("(el) => el.validity.rangeUnderflow")
     assert not cantidad.evaluate("(el) => el.validity.valid")
 
@@ -414,13 +459,17 @@ def test_cp16_recarga_de_un_boleto(page: Page):
     assert saldo_listado(page, dni) == saldo_inicial + 1
 
 
-# CP-17: una cantidad fraccionaria debe ser inválida.
-def test_cp17_recarga_fraccionaria(page: Page):
+# CP-17: cantidades fraccionarias deben ser inválidas.
+@pytest.mark.parametrize(
+    "cantidad_fraccionaria",
+    [pytest.param("0.5", id="medio-boleto"), pytest.param("2.5", id="dos-y-medio")],
+)
+def test_cp17_recarga_fraccionaria(page: Page, cantidad_fraccionaria: str):
     iniciar_sesion(page)
     dni = crear_beneficiario_activo(page)
     saldo_inicial = saldo_listado(page, dni)
 
-    completar_recarga(page, dni, "2.5")
+    completar_recarga(page, dni, cantidad_fraccionaria)
     cantidad = page.get_by_role("spinbutton")
 
     assert cantidad.evaluate("(el) => el.validity.stepMismatch")
@@ -440,6 +489,22 @@ def test_cp18_boton_bloqueado_sin_cantidad(page: Page):
     expect(page.get_by_role(
         "button", name="Recargar", exact=True
     )).to_be_disabled()
+
+
+# CP-18.1: repetir el caso de cantidad vacía en emulación móvil Android.
+@pytest.mark.only_browser("chromium")
+def test_cp18_movil_android_sin_cantidad(browser, playwright):
+    contexto = browser.new_context(**playwright.devices["Pixel 5"])
+    page = contexto.new_page()
+    try:
+        iniciar_sesion(page)
+        abrir_recargas(page)
+        page.get_by_role("spinbutton").fill("")
+        expect(
+            page.get_by_role("button", name="Recargar", exact=True)
+        ).to_be_disabled()
+    finally:
+        contexto.close()
 
 
 # CP-19: validar la frontera indicada por el requisito.
@@ -500,14 +565,29 @@ def test_cp19_edad_en_limite_requerido(page: Page):
     ).to_be_visible()
 
 
-# CP-20: el texto ingresado debe mostrarse como texto, no como HTML.
-def test_cp20_sanitizacion_de_texto(page: Page):
+# CP-20: entradas con marcado o carga XSS se deben mostrar como texto.
+@pytest.mark.parametrize(
+    "texto",
+    [
+        pytest.param("QA <b>texto</b>", id="etiqueta-html"),
+        pytest.param("<script>alert('XSS')</script>", id="etiqueta-script"),
+        pytest.param('\"><img src=x onerror=alert(1)>', id="atributo-onerror"),
+    ],
+)
+def test_cp20_sanitizacion_de_texto(page: Page, texto: str):
     iniciar_sesion(page)
     abrir_beneficiarios(page)
 
     dni = nuevo_dni()
-    texto = "QA <b>texto</b>"
     completar_alta(page, dni, nombre=texto)
+
+    dialogos = []
+
+    def cerrar_dialogo(dialog):
+        dialogos.append((dialog.type, dialog.message))
+        dialog.dismiss()
+
+    page.on("dialog", cerrar_dialogo)
 
     page.get_by_role(
         "button", name="Registrar Beneficiario", exact=True
@@ -515,8 +595,10 @@ def test_cp20_sanitizacion_de_texto(page: Page):
 
     fila = buscar_dni(page, dni)
     expect(fila).to_have_count(1, timeout=15000)
-    expect(fila.get_by_role("cell").nth(1)).to_contain_text(texto)
-    expect(fila.locator("b")).to_have_count(0)
+    celda_nombre = fila.get_by_role("cell").nth(1)
+    expect(celda_nombre).to_have_text(texto)
+    expect(celda_nombre.locator("b, script, img[onerror]")).to_have_count(0)
+    assert not dialogos, f"Se abrió un diálogo por la entrada: {dialogos!r}"
 
 
 # CP-21: buscar un beneficiario usando parte del apellido.

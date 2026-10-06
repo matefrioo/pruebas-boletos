@@ -25,11 +25,26 @@ jobs:
       - name: Instalar dependencias
         run: python -m pip install -r requirements.txt
 
-      - name: Instalar Chromium
-        run: python -m playwright install --with-deps chromium
+      - name: Instalar Chromium y Firefox
+        run: python -m playwright install --with-deps chromium firefox
 
-      - name: Ejecutar las pruebas
+      - name: Ejecutar la suite y las variantes de CP-18
         env:
           TEST_EMAIL: ${{ secrets.TEST_EMAIL }}
           TEST_PASSWORD: ${{ secrets.TEST_PASSWORD }}
-        run: python -m pytest test_login.py test_beneficiarios.py test_edad.py test_suite.py -v
+        shell: bash
+        run: |
+          set +e
+
+          python -m pytest test_login.py test_beneficiarios.py test_edad.py test_suite.py --browser chromium -v
+          suite_status=$?
+
+          python -m pytest test_suite.py::test_cp18_boton_bloqueado_sin_cantidad --browser firefox -v
+          firefox_status=$?
+
+          python -m pytest test_suite.py::test_cp18_movil_android_sin_cantidad --browser chromium -v
+          mobile_status=$?
+
+          if [ "$suite_status" -ne 0 ] || [ "$firefox_status" -ne 0 ] || [ "$mobile_status" -ne 0 ]; then
+            exit 1
+          fi
