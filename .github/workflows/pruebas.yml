@@ -28,8 +28,8 @@ jobs:
       - name: Instalar Chromium
         run: python -m playwright install --with-deps chromium
 
-      - name: Ejecutar prueba de login
+      - name: Ejecutar login y alta de beneficiario
         env:
           TEST_EMAIL: ${{ secrets.TEST_EMAIL }}
           TEST_PASSWORD: ${{ secrets.TEST_PASSWORD }}
-        run: python -m pytest test_login.py -v
+        run: python -m pytest test_login.py test_beneficiarios.py -v
