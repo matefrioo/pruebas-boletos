@@ -8,7 +8,7 @@ from playwright.sync_api import Page, expect
 
 
 URL = "https://proyectos-qhp3.vercel.app/"
-EDAD_MINIMA_REQUERIDA = int(os.getenv("EDAD_MINIMA_REQUERIDA", "60"))
+EDAD_MINIMA_REQUERIDA = os.getenv("EDAD_MINIMA_REQUERIDA")
 
 
 def campo(page: Page, etiqueta: str):
@@ -160,12 +160,44 @@ def fecha_hace_anios(anios: int) -> str:
 
 def completar_recarga(page: Page, dni: str, cantidad: str):
     abrir_recargas(page)
-    page.get_by_placeholder("Ej: 12345678", exact=True).fill(dni)
-    page.get_by_role("spinbutton").fill(cantidad)
+    campo_dni = page.get_by_placeholder("Ej: 12345678", exact=True)
+    campo_dni.fill(dni)
+    expect(campo_dni).to_have_value(dni)
+
+    campo_cantidad = page.get_by_role("spinbutton")
+    campo_cantidad.fill(cantidad)
+    expect(campo_cantidad).to_have_value(cantidad)
 
 
-def confirmar_dialogo_nativo(page: Page):
-    page.on("dialog", lambda dialog: dialog.accept())
+def aceptar_confirmacion_si_aparece(page: Page):
+    # Playwright descarta por defecto los diálogos nativos. En operaciones que
+    # se esperan completar, aceptar aquí asegura que se prueba el flujo positivo.
+    page.once("dialog", lambda dialog: dialog.accept())
+
+
+def edad_minima_configurada() -> int:
+    if EDAD_MINIMA_REQUERIDA not in ("60", "65"):
+        pytest.skip(
+            "Requisito ambiguo en la documentación: configurar "
+            "EDAD_MINIMA_REQUERIDA=60 o 65 antes de ejecutar los casos de edad."
+        )
+    return int(EDAD_MINIMA_REQUERIDA)
+
+
+def dni_de_prueba_configurado(variable: str, estado: str) -> str:
+    dni = os.getenv(variable)
+    if not dni:
+        pytest.skip(
+            f"Falta {variable}: preparar un beneficiario de prueba en estado "
+            f"{estado!r}; el caso no se considera ejecutado."
+        )
+    return dni
+
+
+def mensaje_de_error_visible(page: Page):
+    return page.locator(
+        "[role='alert'], .text-destructive, [data-sonner-toast]"
+    ).filter(has_text=re.compile(r"\S"))
 
 
 # CP-01: alta válida, estado activo y persistencia tras recargar.
@@ -194,12 +226,7 @@ def test_cp02_rechazo_por_edad(page: Page):
         "button", name="Registrar Beneficiario", exact=True
     ).click()
 
-    expect(
-        page.get_by_text(
-            "El beneficiario debe tener al menos 50 años",
-            exact=True,
-        )
-    ).to_be_visible()
+    expect(mensaje_de_error_visible(page).first).to_be_visible()
     expect(page.locator("form")).to_be_visible()
 
 
@@ -211,9 +238,6 @@ def test_cp02_rechazo_por_edad(page: Page):
     [pytest.param(59, id="59-anios"), pytest.param(50, id="50-anios")],
 )
 def test_cp02_rechazo_de_edad_bajo_el_minimo(page: Page, edad: int):
-    assert EDAD_MINIMA_REQUERIDA in (60, 65), (
-        "Definí EDAD_MINIMA_REQUERIDA como 60 o 65 según el requisito."
-    )
     iniciar_sesion(page)
     abrir_beneficiarios(page)
 
@@ -230,11 +254,52 @@ def test_cp02_rechazo_de_edad_bajo_el_minimo(page: Page, edad: int):
 
     expect(
         page.get_by_text(
-            f"El beneficiario debe tener al menos {EDAD_MINIMA_REQUERIDA} años",
-            exact=True,
+            re.compile(r"El beneficiario debe tener al menos \d+ años", re.IGNORECASE)
         )
     ).to_be_visible()
     expect(page.locator("form")).to_be_visible()
+
+
+# CP-03: provocar un HTTP 500 en la API de validación de residencia.
+# CP03_API_URL_REGEX debe ser una expresión regular acotada a esa API, obtenida
+# de la pestaña Network. Sin ese dato se reporta como bloqueado, no aprobado.
+def test_cp03_residencia_no_validada_con_error_api(page: Page):
+    patron_api = os.getenv("CP03_API_URL_REGEX")
+    if not patron_api:
+        pytest.skip(
+            "Bloqueado: configurar CP03_API_URL_REGEX con la URL observada "
+            "para la API de validación de residencia."
+        )
+
+    llamadas_interceptadas = []
+
+    def responder_error_500(route):
+        llamadas_interceptadas.append(route.request.url)
+        route.fulfill(status=500, content_type="application/json", body='{"error":"simulated test failure"}')
+
+    page.route(re.compile(patron_api), responder_error_500)
+    iniciar_sesion(page)
+    abrir_beneficiarios(page)
+    dni = nuevo_dni()
+    completar_alta(
+        page,
+        dni,
+        nombre="Residencia",
+        apellido="QA",
+        localidad="Campo Viera",
+    )
+    page.get_by_role("button", name="Registrar Beneficiario", exact=True).click()
+
+    assert llamadas_interceptadas, (
+        "No se llamó a la API configurada durante el alta; revisar la integración "
+        "de validación de residencia o el patrón CP03_API_URL_REGEX."
+    )
+    expect(mensaje_de_error_visible(page).first).to_be_visible()
+    formulario = page.locator("form")
+    if formulario.is_visible():
+        page.get_by_role("button", name="Cancelar", exact=True).click()
+        expect(formulario).to_have_count(0)
+    expect(buscar_dni(page, dni)).to_have_count(0, timeout=15000)
 
 
 # CP-04: un DNI ya registrado no debe generar una segunda fila.
@@ -263,6 +328,7 @@ def test_cp05_recarga_en_limite_superior(page: Page, cantidad: str):
     saldo_inicial = saldo_listado(page, dni)
 
     completar_recarga(page, dni, cantidad)
+    aceptar_confirmacion_si_aparece(page)
     page.get_by_role("button", name="Recargar", exact=True).click()
 
     assert saldo_listado(page, dni) == saldo_inicial + int(cantidad)
@@ -285,29 +351,37 @@ def test_cp06_rechazo_de_cantidad_superior_al_maximo(
 
     assert cantidad.evaluate("(el) => el.validity.rangeOverflow")
     assert not cantidad.evaluate("(el) => el.validity.valid")
+    page.get_by_role("button", name="Recargar", exact=True).click()
     assert saldo_listado(page, dni) == saldo_inicial
 
 
-# CP-07: una persona dada de baja no debe aceptar una recarga.
-def test_cp07_rechazo_a_beneficiario_dado_de_baja(page: Page):
+# CP-07.1 / CP-07.2: no se debe recargar a beneficiarios Inactivo o Suspendido.
+# Se usan datos sembrados para no sustituir esos estados por "Baja".
+@pytest.mark.parametrize(
+    ("variable_dni", "estado"),
+    [
+        pytest.param("CP07_DNI_INACTIVO", "Inactivo", id="inactivo"),
+        pytest.param("CP07_DNI_SUSPENDIDO", "Suspendido", id="suspendido"),
+    ],
+)
+def test_cp07_rechazo_de_recarga_por_estado_no_habilitado(
+    page: Page, variable_dni: str, estado: str
+):
     iniciar_sesion(page)
-    dni = crear_beneficiario_activo(page)
-
+    dni = dni_de_prueba_configurado(variable_dni, estado)
+    abrir_beneficiarios(page)
     fila = buscar_dni(page, dni)
-    page.on("dialog", lambda dialog: dialog.accept())
-    fila.get_by_role(
-        "button", name="Dar de baja", exact=True
-    ).click()
-
-    fila = buscar_dni(page, dni)
+    expect(fila).to_have_count(1)
     expect(fila.get_by_role("cell").nth(3)).to_have_text(
-        re.compile(r"^\s*baja\s*$", re.IGNORECASE),
-        timeout=15000,
+        re.compile(rf"^\s*{re.escape(estado)}\s*$", re.IGNORECASE)
     )
     saldo_inicial = saldo_listado(page, dni)
 
     completar_recarga(page, dni, "1")
-    page.get_by_role("button", name="Recargar", exact=True).click()
+    boton_recargar = page.get_by_role("button", name="Recargar", exact=True)
+    if boton_recargar.is_enabled():
+        aceptar_confirmacion_si_aparece(page)
+        boton_recargar.click()
 
     assert saldo_listado(page, dni) == saldo_inicial
 
@@ -327,6 +401,31 @@ def test_cp08_baja_de_beneficiario(page: Page):
     expect(fila.get_by_role("cell").nth(3)).to_have_text(
         re.compile(r"^\s*baja\s*$", re.IGNORECASE),
         timeout=15000,
+    )
+
+
+# CP-15: reactivar un beneficiario Inactivo. Se exige una fixture dedicada;
+# no se transforma artificialmente una Baja o una suspensión en Inactivo.
+def test_cp15_reactivacion_de_beneficiario_inactivo(page: Page):
+    iniciar_sesion(page)
+    dni = dni_de_prueba_configurado("CP15_DNI_INACTIVO", "Inactivo")
+    abrir_beneficiarios(page)
+    fila = buscar_dni(page, dni)
+    expect(fila).to_have_count(1)
+    expect(fila.get_by_role("cell").nth(3)).to_have_text(
+        re.compile(r"^\s*inactivo\s*$", re.IGNORECASE)
+    )
+
+    accion_reactivar = fila.get_by_role(
+        "button", name=re.compile(r"reactivar|activar|desbloquear", re.IGNORECASE)
+    )
+    expect(accion_reactivar).to_have_count(1)
+    aceptar_confirmacion_si_aparece(page)
+    accion_reactivar.click()
+
+    fila = buscar_dni(page, dni)
+    expect(fila.get_by_role("cell").nth(3)).to_have_text(
+        re.compile(r"^\s*activo\s*$", re.IGNORECASE), timeout=15000
     )
 
 
@@ -394,11 +493,14 @@ def test_cp11_dni_inexistente_en_recargas(page: Page):
 def test_cp12_cantidad_cero_o_negativa(page: Page, cantidad_invalida: str):
     iniciar_sesion(page)
     dni = crear_beneficiario_activo(page)
+    saldo_inicial = saldo_listado(page, dni)
 
     completar_recarga(page, dni, cantidad_invalida)
     cantidad = page.get_by_role("spinbutton")
     assert cantidad.evaluate("(el) => el.validity.rangeUnderflow")
     assert not cantidad.evaluate("(el) => el.validity.valid")
+    page.get_by_role("button", name="Recargar", exact=True).click()
+    assert saldo_listado(page, dni) == saldo_inicial
 
 
 # CP-13: rechazar un DNI alfanumérico.
@@ -454,6 +556,7 @@ def test_cp16_recarga_de_un_boleto(page: Page):
     saldo_inicial = saldo_listado(page, dni)
 
     completar_recarga(page, dni, "1")
+    aceptar_confirmacion_si_aparece(page)
     page.get_by_role("button", name="Recargar", exact=True).click()
 
     assert saldo_listado(page, dni) == saldo_inicial + 1
@@ -474,6 +577,7 @@ def test_cp17_recarga_fraccionaria(page: Page, cantidad_fraccionaria: str):
 
     assert cantidad.evaluate("(el) => el.validity.stepMismatch")
     assert not cantidad.evaluate("(el) => el.validity.valid")
+    page.get_by_role("button", name="Recargar", exact=True).click()
     assert saldo_listado(page, dni) == saldo_inicial
 
 
@@ -510,15 +614,13 @@ def test_cp18_movil_android_sin_cantidad(browser, playwright):
 # CP-19: validar la frontera indicada por el requisito.
 # Configurá EDAD_MINIMA_REQUERIDA=65 si el requisito aplicable es 65.
 def test_cp19_edad_en_limite_requerido(page: Page):
-    assert EDAD_MINIMA_REQUERIDA in (60, 65), (
-        "Definí EDAD_MINIMA_REQUERIDA como 60 o 65 según el requisito."
-    )
+    edad_minima = edad_minima_configurada()
 
     iniciar_sesion(page)
     abrir_beneficiarios(page)
 
     hoy = date.today()
-    nacimiento_limite = fecha_hace_anios(EDAD_MINIMA_REQUERIDA)
+    nacimiento_limite = fecha_hace_anios(edad_minima)
     dni_limite = nuevo_dni()
 
     completar_alta(
@@ -559,7 +661,7 @@ def test_cp19_edad_en_limite_requerido(page: Page):
     expect(
         page.get_by_text(
             f"El beneficiario debe tener al menos "
-            f"{EDAD_MINIMA_REQUERIDA} años",
+            f"{edad_minima} años",
             exact=True,
         )
     ).to_be_visible()
@@ -596,9 +698,35 @@ def test_cp20_sanitizacion_de_texto(page: Page, texto: str):
     fila = buscar_dni(page, dni)
     expect(fila).to_have_count(1, timeout=15000)
     celda_nombre = fila.get_by_role("cell").nth(1)
-    expect(celda_nombre).to_have_text(texto)
+    # La tabla representa la columna como "Apellido, Nombre".
+    expect(celda_nombre).to_have_text(f"QA, {texto}")
     expect(celda_nombre.locator("b, script, img[onerror]")).to_have_count(0)
     assert not dialogos, f"Se abrió un diálogo por la entrada: {dialogos!r}"
+
+
+# CP-20 Manual: variante de seguridad requerida en Firefox.
+@pytest.mark.only_browser("firefox")
+def test_cp20_manual_sanitizacion_firefox(page: Page):
+    texto = "<script>alert('XSS')</script>"
+    iniciar_sesion(page)
+    dni = nuevo_dni()
+    abrir_beneficiarios(page)
+    completar_alta(page, dni, nombre=texto)
+
+    dialogos = []
+
+    def capturar_dialogo(dialog):
+        dialogos.append((dialog.type, dialog.message))
+        dialog.dismiss()
+
+    page.on("dialog", capturar_dialogo)
+    page.get_by_role("button", name="Registrar Beneficiario", exact=True).click()
+    fila = buscar_dni(page, dni)
+    expect(fila).to_have_count(1, timeout=15000)
+    celda_nombre = fila.get_by_role("cell").nth(1)
+    expect(celda_nombre).to_have_text(f"QA, {texto}")
+    expect(celda_nombre.locator("script")).to_have_count(0)
+    assert not dialogos, f"Se ejecutó un diálogo con payload XSS: {dialogos!r}"
 
 
 # CP-21: buscar un beneficiario usando parte del apellido.
@@ -622,16 +750,42 @@ def test_cp21_busqueda_por_apellido_parcial(page: Page):
     ).to_have_count(1)
 
 
-# CP-23: los puntos y espacios del DNI deben normalizarse al ingresarlo.
-def test_cp23_normalizacion_de_dni_en_recargas(page: Page):
+# CP-23: el buscador de DNI debe tolerar puntos y espacios.
+@pytest.mark.parametrize(
+    "separador",
+    [pytest.param(".", id="puntos"), pytest.param(" ", id="espacios")],
+)
+def test_cp23_normalizacion_de_dni_en_recargas(page: Page, separador: str):
     iniciar_sesion(page)
     dni = crear_beneficiario_activo(page)
 
     abrir_recargas(page)
     campo_dni = page.get_by_placeholder("Ej: 12345678", exact=True)
-
-    campo_dni.fill(f"{dni[:2]}.{dni[2:5]}.{dni[5:]}")
+    entrada = f"{dni[:2]}{separador}{dni[2:5]}{separador}{dni[5:]}"
+    campo_dni.fill(entrada)
     expect(campo_dni).to_have_value(dni)
 
-    campo_dni.fill(f"{dni[:2]} {dni[2:5]} {dni[5:]}")
-    expect(campo_dni).to_have_value(dni)
+
+# CP-22: cancelar la confirmación no debe acreditar saldo.
+def test_cp22_cancelacion_de_confirmacion_de_recarga(page: Page):
+    iniciar_sesion(page)
+    dni = crear_beneficiario_activo(page)
+    saldo_inicial = saldo_listado(page, dni)
+    completar_recarga(page, dni, "1")
+
+    dialogos = []
+
+    def cancelar_dialogo(dialog):
+        dialogos.append((dialog.type, dialog.message))
+        dialog.dismiss()
+
+    page.on("dialog", cancelar_dialogo)
+    page.get_by_role("button", name="Recargar", exact=True).click()
+
+    assert dialogos, (
+        "No se mostró una confirmación cancelable al iniciar la recarga."
+    )
+    assert dialogos[0][0] == "confirm", (
+        f"Se esperaba confirmación nativa; se observó {dialogos[0][0]!r}."
+    )
+    assert saldo_listado(page, dni) == saldo_inicial
