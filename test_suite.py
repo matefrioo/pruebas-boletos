@@ -148,6 +148,13 @@ def saldo_listado(page: Page, dni: str) -> int:
     assert numeros, f"No pude leer el saldo de la fila: {texto!r}"
     return int(numeros[0])
 
+def esperar_saldo(page: Page, dni: str, saldo_esperado: int):
+    abrir_beneficiarios(page)
+    fila = buscar_dni(page, dni)
+    expect(fila).to_have_count(1, timeout=3000)
+
+    celda_saldo = fila.get_by_role("cell").nth(4)
+    expect(celda_saldo).to_have_text(str(saldo_esperado), timeout=3000)
 
 def fecha_hace_anios(anios: int) -> str:
     hoy = date.today()
@@ -317,21 +324,37 @@ def test_cp04_dni_duplicado(page: Page):
     expect(fila).to_have_count(1, timeout=15000)
 
 
-# CP-05: acreditar cantidades válidas en el límite superior.
+
+# CP-05: acreditar cantidades válidas de 14 y 15 boletos.
 @pytest.mark.parametrize(
     "cantidad",
-    [pytest.param("14", id="14-boletos"), pytest.param("15", id="15-boletos")],
+    [
+        pytest.param("14", id="14-boletos"),
+        pytest.param("15", id="15-boletos"),
+    ],
 )
 def test_cp05_recarga_en_limite_superior(page: Page, cantidad: str):
     iniciar_sesion(page)
     dni = crear_beneficiario_activo(page)
     saldo_inicial = saldo_listado(page, dni)
 
-    completar_recarga(page, dni, cantidad)
-    aceptar_confirmacion_si_aparece(page)
-    page.get_by_role("button", name="Recargar", exact=True).click()
+    # Pasos basados en la grabación de Playwright.
+    page.get_by_role(
+        "button", name="Recargas Acreditacion de"
+    ).click()
 
-    assert saldo_listado(page, dni) == saldo_inicial + int(cantidad)
+    campo_dni = page.get_by_role("textbox", name="Ej:")
+    campo_dni.fill(dni)
+    expect(campo_dni).to_have_value(dni)
+
+    campo_cantidad = page.get_by_role("spinbutton")
+    campo_cantidad.fill(cantidad)
+    expect(campo_cantidad).to_have_value(cantidad)
+
+    page.get_by_role("button", name="Recargar").click()
+
+    # Se espera que el saldo aumente exactamente la cantidad ingresada.
+    esperar_saldo(page, dni, saldo_inicial + int(cantidad))
 
 
 # CP-06: cantidades superiores a 15 deben superar el límite HTML.
@@ -387,22 +410,30 @@ def test_cp07_rechazo_de_recarga_por_estado_no_habilitado(
 
 
 # CP-8: dar de baja un beneficiario de prueba.
+# CP-08: dar de baja un beneficiario de prueba.
 def test_cp08_baja_de_beneficiario(page: Page):
     iniciar_sesion(page)
     dni = crear_beneficiario_activo(page)
 
     fila = buscar_dni(page, dni)
-    page.on("dialog", lambda dialog: dialog.accept())
+    expect(fila).to_have_count(1)
+
     fila.get_by_role(
         "button", name="Dar de baja", exact=True
     ).click()
 
+    confirmar_baja = page.get_by_role(
+        "button", name="Confirmar baja", exact=True
+    )
+    expect(confirmar_baja).to_be_visible()
+    confirmar_baja.click()
+
     fila = buscar_dni(page, dni)
+    expect(fila).to_have_count(1)
     expect(fila.get_by_role("cell").nth(3)).to_have_text(
         re.compile(r"^\s*baja\s*$", re.IGNORECASE),
         timeout=15000,
     )
-
 
 # CP-15: reactivar un beneficiario Inactivo. Se exige una fixture dedicada;
 # no se transforma artificialmente una Baja o una suspensión en Inactivo.
@@ -559,7 +590,7 @@ def test_cp16_recarga_de_un_boleto(page: Page):
     aceptar_confirmacion_si_aparece(page)
     page.get_by_role("button", name="Recargar", exact=True).click()
 
-    assert saldo_listado(page, dni) == saldo_inicial + 1
+    esperar_saldo(page, dni, saldo_inicial + 1)
 
 
 # CP-17: cantidades fraccionarias deben ser inválidas.
@@ -600,16 +631,27 @@ def test_cp18_boton_bloqueado_sin_cantidad(page: Page):
 def test_cp18_movil_android_sin_cantidad(browser, playwright):
     contexto = browser.new_context(**playwright.devices["Pixel 5"])
     page = contexto.new_page()
+    page.set_default_timeout(10000)
+
     try:
         iniciar_sesion(page)
-        abrir_recargas(page)
-        page.get_by_role("spinbutton").fill("")
-        expect(
-            page.get_by_role("button", name="Recargar", exact=True)
-        ).to_be_disabled()
+
+        boton_recargas = page.get_by_role(
+            "button", name="Recargas", exact=True
+        )
+        expect(boton_recargas).to_be_visible(timeout=10000)
+        boton_recargas.click(timeout=10000)
+
+        cantidad = page.get_by_role("spinbutton")
+        expect(cantidad).to_be_visible(timeout=10000)
+        cantidad.fill("")
+
+        boton_recargar = page.get_by_role(
+            "button", name="Recargar", exact=True
+        )
+        expect(boton_recargar).to_be_disabled(timeout=10000)
     finally:
         contexto.close()
-
 
 # CP-19: validar la frontera indicada por el requisito.
 # Configurá EDAD_MINIMA_REQUERIDA=65 si el requisito aplicable es 65.
@@ -732,22 +774,38 @@ def test_cp20_manual_sanitizacion_firefox(page: Page):
 # CP-21: buscar un beneficiario usando parte del apellido.
 def test_cp21_busqueda_por_apellido_parcial(page: Page):
     iniciar_sesion(page)
-    apellido = f"ApellidoQA{secrets.randbelow(100000)}"
-    dni = crear_beneficiario_activo(page, apellido=apellido)
+    abrir_beneficiarios(page)
 
-    fila = buscar_dni(page, dni)
-    expect(fila).to_have_count(1)
+    token = "".join(
+        secrets.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ") for _ in range(8)
+    )
+    fragmento = token[:6]
+    apellido = f"ApellidoQA{token}"
 
     buscador = page.get_by_placeholder(
         "Buscar por DNI, nombre o localidad", exact=True
     )
-    buscador.fill(apellido[:10])
 
-    expect(
-        page.locator("tbody tr").filter(
-            has_text=re.compile(re.escape(apellido[:10]), re.IGNORECASE)
-        )
-    ).to_have_count(1)
+    # Comprueba que el fragmento no coincida con datos anteriores.
+    buscador.fill(fragmento)
+    filas_coincidentes = page.locator("tbody tr").filter(
+        has_text=re.compile(re.escape(fragmento), re.IGNORECASE)
+    )
+    expect(filas_coincidentes).to_have_count(0, timeout=10000)
+
+    dni = crear_beneficiario_activo(page, apellido=apellido)
+
+    buscador.fill(fragmento)
+    filas_coincidentes = page.locator("tbody tr").filter(
+        has_text=re.compile(re.escape(fragmento), re.IGNORECASE)
+    )
+    expect(filas_coincidentes).to_have_count(1, timeout=15000)
+
+    fila = filas_coincidentes.filter(
+        has=page.get_by_role("cell", name=patron_dni(dni))
+    )
+    expect(fila).to_have_count(1)
+    expect(fila.get_by_role("cell").nth(1)).to_contain_text(fragmento)
 
 
 # CP-23: el buscador de DNI debe tolerar puntos y espacios.
@@ -766,12 +824,17 @@ def test_cp23_normalizacion_de_dni_en_recargas(page: Page, separador: str):
     expect(campo_dni).to_have_value(dni)
 
 
-# CP-22: cancelar la confirmación no debe acreditar saldo.
+
+# CP-22: la recarga debe pedir confirmación y poder cancelarse.
 def test_cp22_cancelacion_de_confirmacion_de_recarga(page: Page):
     iniciar_sesion(page)
     dni = crear_beneficiario_activo(page)
     saldo_inicial = saldo_listado(page, dni)
-    completar_recarga(page, dni, "1")
+
+    # Pasos obtenidos con Playwright Codegen.
+    page.get_by_role("button", name="Recargas Acreditacion de").click()
+    page.get_by_role("textbox", name="Ej:").fill(dni)
+    page.get_by_role("spinbutton").fill("1")
 
     dialogos = []
 
@@ -779,13 +842,15 @@ def test_cp22_cancelacion_de_confirmacion_de_recarga(page: Page):
         dialogos.append((dialog.type, dialog.message))
         dialog.dismiss()
 
-    page.on("dialog", cancelar_dialogo)
+    page.once("dialog", cancelar_dialogo)
     page.get_by_role("button", name="Recargar", exact=True).click()
 
     assert dialogos, (
-        "No se mostró una confirmación cancelable al iniciar la recarga."
+        "CP-22 falló: no se mostró una confirmación cancelable "
+        "al iniciar la recarga."
     )
     assert dialogos[0][0] == "confirm", (
-        f"Se esperaba confirmación nativa; se observó {dialogos[0][0]!r}."
+        f"Se esperaba una confirmación; se observó {dialogos[0][0]!r}."
     )
+
     assert saldo_listado(page, dni) == saldo_inicial
